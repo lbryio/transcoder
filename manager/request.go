@@ -4,15 +4,17 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"math"
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/nikooo777/lbry-blobs-downloader/downloader"
+	"github.com/nikooo777/lbry-blobs-downloader/shared"
 
 	ljsonrpc "github.com/lbryio/lbry.go/v2/extras/jsonrpc"
 	"github.com/lbryio/transcoder/pkg/mfr"
@@ -20,8 +22,11 @@ import (
 )
 
 var (
-	lbrytvAPI = "https://api.lbry.tv/api/v1/proxy"
-	cdnServer = "https://cdn.lbryplayer.xyz/api/v3/streams"
+	lbrytvAPI  = "https://api.lbry.tv/api/v1/proxy"
+	cdnServer  = "https://cdn.lbryplayer.xyz/api/v3/streams"
+	blobServer = "cdn.lbryplayer.xyz"
+	udpPort    = 5568
+	tcpPort    = 5567
 
 	lbrytvClient   = ljsonrpc.NewClient(lbrytvAPI)
 	downloadClient = &http.Client{
@@ -113,53 +118,36 @@ func Resolve(uri string) (*ljsonrpc.Claim, error) {
 
 // Download retrieves a video stream from the lbrytv CDN and saves it to a temporary file.
 func (c *TranscodingRequest) Download(dest string) (*os.File, int64, error) {
-	var readLen int64
+	shared.ReflectorPeerServer = fmt.Sprintf("%s:%d", blobServer, tcpPort)
+	shared.ReflectorQuicServer = fmt.Sprintf("%s:%d", blobServer, udpPort)
 
-	req, err := http.NewRequest("GET", c.cdnURL(), nil)
+	var readLen int64
+	logger.Infow("downloading stream", "url", c.URI)
+	t := timer.Start()
+
+	if err := os.MkdirAll(dest, os.ModePerm); err != nil {
+		return nil, 0, err
+	}
+
+	if err := downloader.DownloadAndBuild(c.SDHash, false, downloader.UDP, c.streamFileName(), dest); err != nil {
+		return nil, 0, err
+	}
+	t.Stop()
+
+	fi, err := os.Stat(path.Join(dest, c.streamFileName()))
 	if err != nil {
 		return nil, 0, err
 	}
-	logger.Infow("downloading stream", "url", c.cdnURL())
+	readLen = fi.Size()
 
-	tmr := timer.Start()
-
-	resp, err := downloadClient.Do(req)
+	f, err := os.Open(path.Join(dest, c.streamFileName()))
 	if err != nil {
-		return nil, readLen, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, readLen, fmt.Errorf("http response not ok: %v", resp.StatusCode)
-	}
-	defer resp.Body.Close()
-
-	if err = os.MkdirAll(dest, os.ModePerm); err != nil {
-		return nil, readLen, err
+		return nil, 0, err
 	}
 
-	out, err := ioutil.TempFile(dest, c.streamFileName())
-	if err != nil {
-		return nil, readLen, err
-	}
-
-	wc := &WriteCounter{
-		Size:           uint64(resp.ContentLength),
-		Started:        time.Now(),
-		URL:            c.cdnURL(),
-		progressLogged: map[int]bool{},
-	}
-	if readLen, err = io.Copy(out, io.TeeReader(resp.Body, wc)); err != nil {
-		out.Close()
-		os.Remove(out.Name())
-		return nil, readLen, err
-	}
-	tmr.Stop()
-	rate := int64(float64(readLen) / tmr.Duration())
-	logger.Infow("stream downloaded", "url", c.cdnURL(), "rate", rate, "size", readLen, "seconds_spent", tmr.DurationInt())
-	return out, readLen, nil
-}
-
-func (c *TranscodingRequest) cdnURL() string {
-	return fmt.Sprintf("%s/free/%s/%s/%s", cdnServer, c.Name, c.ClaimID, c.SDHash[:6])
+	rate := int64(float64(readLen) / t.Duration())
+	logger.Infow("stream downloaded", "url", c.URI, "rate", rate, "size", readLen, "seconds_spent", t.DurationInt())
+	return f, readLen, nil
 }
 
 func (r *TranscodingRequest) Release() {
